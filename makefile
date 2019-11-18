@@ -10,8 +10,8 @@ LIBS=-lavdevice -lavfilter -lavformat -lavcodec \
 -lx264  -lxvidcore  -lkvazaar  -pthread  -ldl -lpthread  -lX11
 
 FLAG= -std=c++14   -g -Wl,-rpath,/usr/local/lib -Wl,--enable-new-dtags
-CC=g++ 
-SOURCE= record.cc 
+CC=clang++ 
+SOURCE= main.cc record.cc 
 
 record:
 	${CC} ${SOURCE} ${INCLUDE_DIR} ${LIB_DIR} ${LIBS} -static-libstdc++  -Wl,-Bstatic -lx265  -lnuma -lssl -lcrypto -Wl,-Bdynamic -ltcmalloc
