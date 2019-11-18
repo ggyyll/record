@@ -136,8 +136,9 @@ void Record::InitEnv()
 
 void Record::Stop()
 {
-    runing_ = false;
+    runing_.store(false);
 }
+
 void Record::InitInput()
 {
     AVDictionary* options = NULL;
@@ -279,7 +280,7 @@ void Record::InitOutput()
 
     if (!(output_fmt_->flags & AVFMT_NOFILE))
     {
-        int ret = avio_open(&output_fmt_ctx_->pb, out_name_.data(), AVIO_FLAG_WRITE);
+        ret = avio_open(&output_fmt_ctx_->pb, out_name_.data(), AVIO_FLAG_WRITE);
         if (ret < 0)
         {
             printf("Could not open output file '%s'", out_name_.data());
@@ -298,6 +299,20 @@ void Record::InitOutput()
     }
 }
 
+#define CONTINUE_OR_BREAK                                 \
+    {                                                     \
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) \
+        {                                                 \
+                                                          \
+            continue;                                     \
+        }                                                 \
+        if (ret < 0)                                      \
+        {                                                 \
+            assert(false);                                \
+            break;                                        \
+        }                                                 \
+    }
+
 void Record::Run()
 {
     AVFrame* frame = av_frame_alloc();
@@ -311,18 +326,16 @@ void Record::Run()
     }
     av_init_packet(packet);
 
-    auto scoped_frame = make_scoped_exit([&]() {
-        av_frame_free(&frame);
-        av_packet_free(&packet);
-    });
+    auto scoped_frame = make_scoped_exit([&]() { av_frame_free(&frame); av_packet_free(&packet); });
+
     std::string file_name = std::to_string(::time(NULL));
     file_name += ".yuv";
 
     FILE* fp_yuv = fopen(file_name.data(), "wb+");
     assert(fp_yuv);
     auto scoped = make_scoped_exit([& fp = fp_yuv]() { fclose(fp); });
-    runing_ = true;
-    while (runing_)
+    runing_.store(true);
+    while (runing_.load())
     {
         int ret = av_read_frame(input_fmt_ctx_, packet);
         if (ret < 0)
@@ -334,83 +347,100 @@ void Record::Run()
             continue;
         }
 
-        auto scoped_packet = make_scoped_exit([& pkt = packet]() { av_packet_unref(pkt); });
+        auto scoped_packet1 = make_scoped_exit([& pkt = packet]() { av_packet_unref(pkt); });
 
-        ret = avcodec_send_packet(decoder_codec_ctx_, packet);
-        if (ret < 0 || ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+        ret = DecodeFrame(decoder_codec_ctx_, frame, packet);
+        CONTINUE_OR_BREAK;
+        assert(ret == 0);
+
+        sws_scale(sws_ctx_, (const unsigned char* const*)frame->data, frame->linesize, 0, decoder_codec_ctx_->height, pFrameYUV->data, pFrameYUV->linesize);
+
+        WriteFile(decoder_codec_ctx_, pFrameYUV, fp_yuv);
+
+        pFrameYUV->format = AV_PIX_FMT_YUV420P;
+        pFrameYUV->width = encoder_codec_ctx_->width;
+        pFrameYUV->height = encoder_codec_ctx_->height;
+
+        AVPacket out_packet = {0};
+        av_init_packet(&out_packet);
+        out_packet.data = NULL;
+        out_packet.size = 0;
+
+        ret = EncodePacket(encoder_codec_ctx_, pFrameYUV, &out_packet);
+        CONTINUE_OR_BREAK;
+
+        auto scoped_packet = make_scoped_exit([& pkt = out_packet]() { av_packet_unref(&pkt); });
+
+        if (out_packet.pts != AV_NOPTS_VALUE)
         {
-            // flush codec ? continue
-            break;
+            out_packet.pts = av_rescale_q(out_packet.pts, encoder_codec_ctx_->time_base, output_stream_->time_base);
         }
-        while (ret >= 0)
+
+        if (av_write_frame(output_fmt_ctx_, &out_packet) != 0)
         {
-            ret = avcodec_receive_frame(decoder_codec_ctx_, frame);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-            {
-                break;
-            }
-            else if (ret < 0)
-            {
-                // Reset ?
-                break;
-            }
-            assert(ret == 0);
-
-            sws_scale(sws_ctx_, (const unsigned char* const*)frame->data, frame->linesize, 0, decoder_codec_ctx_->height, pFrameYUV->data, pFrameYUV->linesize);
-            int y_size = decoder_codec_ctx_->width * decoder_codec_ctx_->height;
-            fwrite(pFrameYUV->data[0], 1, y_size, fp_yuv);      //Y
-            fwrite(pFrameYUV->data[1], 1, y_size / 4, fp_yuv);  //U
-            fwrite(pFrameYUV->data[2], 1, y_size / 4, fp_yuv);  //V
-
-            pFrameYUV->format = AV_PIX_FMT_YUV420P;
-            pFrameYUV->width = encoder_codec_ctx_->width;
-            pFrameYUV->height = encoder_codec_ctx_->height;
-
-            ret = avcodec_send_frame(encoder_codec_ctx_, pFrameYUV);
-            if (ret < 0)
-            {
-                printf("%s Error sending a frame for encoding\n", av_err2str(ret));
-                assert(false);
-                break;
-            }
-
-            while (ret >= 0)
-            {
-                AVPacket out_packet = {0};
-                av_init_packet(&out_packet);
-                out_packet.data = NULL;  // packet data will be allocated by the encoder
-                out_packet.size = 0;
-
-                ret = avcodec_receive_packet(encoder_codec_ctx_, &out_packet);
-                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-                {
-                    break;
-                }
-                else if (ret < 0)
-                {
-                    printf("Error during encoding\n");
-                    assert(false);
-                    break;
-                }
-
-                auto scoped_packet = make_scoped_exit([& pkt = out_packet]() { av_packet_unref(&pkt); });
-
-                if (out_packet.pts != AV_NOPTS_VALUE)
-                    out_packet.pts = av_rescale_q(out_packet.pts, encoder_codec_ctx_->time_base, output_stream_->time_base);
-
-                if (av_write_frame(output_fmt_ctx_, &out_packet) != 0)
-                {
-                    printf("\nerror in writing video frame\n");
-                    assert(false);
-                }
-            }
+            assert(false);
         }
     }
 
     int ret = av_write_trailer(output_fmt_ctx_);
     if (ret < 0)
     {
-        printf("\nerror in writing av trailer\n");
-        exit(1);
+        assert(false);
     }
+}
+
+int Record::DecodeFrame(AVCodecContext* codecContext, AVFrame* frame, AVPacket* packet)
+{
+    int status = avcodec_send_packet(codecContext, packet);
+
+    if (status < 0)
+    {
+        return status;
+    }
+
+    status = avcodec_receive_frame(codecContext, frame);
+
+    if (status == AVERROR(EAGAIN) || status == AVERROR_EOF)
+    {
+        return status;
+    }
+
+    if (status < 0)
+    {
+        return status;
+    }
+
+    return status;
+}
+
+int Record::EncodePacket(AVCodecContext* codecContext, AVFrame* frame, AVPacket* packet)
+{
+    int status = avcodec_send_frame(codecContext, frame);
+
+    if (status < 0)
+    {
+        return status;
+    }
+
+    status = avcodec_receive_packet(codecContext, packet);
+
+    if (status == AVERROR(EAGAIN) || status == AVERROR_EOF)
+    {
+        return status;
+    }
+
+    if (status < 0)
+    {
+        return status;
+    }
+
+    return status;
+}
+
+void Record::WriteFile(AVCodecContext* codecContext, AVFrame* frame, FILE* fp)
+{
+    int y_size = codecContext->width * codecContext->height;
+    fwrite(frame->data[0], 1, y_size, fp);      //Y
+    fwrite(frame->data[1], 1, y_size / 4, fp);  //U
+    fwrite(frame->data[2], 1, y_size / 4, fp);  //V
 }

@@ -12,6 +12,7 @@ struct AVCodecContext;
 struct AVCodec;
 struct SwsContext;
 struct AVFrame;
+struct AVPacket;
 struct AVStream;
 class Record
 {
@@ -26,6 +27,10 @@ private:
     void InitInput();
     void InitOutput();
     void DecodeAndEncode();
+    int DecodeFrame(AVCodecContext *codecContext, AVFrame *frame, AVPacket *packet);
+    int EncodePacket(AVCodecContext *codecContext, AVFrame *frame, AVPacket *packet);
+    void EofFlush(){};//
+    void WriteFile(AVCodecContext *codecContext,AVFrame*frame,FILE*fp);
 
 private:
     //
