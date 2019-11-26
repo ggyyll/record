@@ -1,19 +1,25 @@
-#include "record.h"
-#include <thread>
-#include <chrono>
+#include "record.hpp"
+#include <functional>
+#include <csignal>
 
-int main(int argc, const char *argv[])
+namespace
 {
-    (void)argc;
-    (void)argv;
-    std::string filename = ":0.0";
-    Record record(filename);
+std::function<void(int)> shutdown_handler;
+void signal_handler(int signal) { shutdown_handler(signal); }
+}  // namespace
+
+int main()
+{
+    std::signal(SIGTERM, signal_handler);
+    std::signal(SIGKILL, signal_handler);
+    std::signal(SIGINT, signal_handler);
+
+    std::string url(":0.0");
+
+    RecordScreen record(url);
     record.InitEnv();
-    std::thread t([&]() {
-        record.Run();
-    });
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-    record.Stop();
-    t.join();
-    return 0;
+
+    shutdown_handler = [& record = record]([[maybe_unused]] int signal) { record.Stop(); };
+
+    record.Run();
 }

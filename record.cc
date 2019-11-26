@@ -1,446 +1,272 @@
-#include <string>
-#include "record.h"
-#include "scoped_exit.h"
+#include "record.hpp"
+#include "head.hpp"
+#include "scoped_exit.hpp"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#define WIDTH 1920
+#define HEIGHT 1080
+#define LINX_X11 "x11grab"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <string.h>
-#include <time.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <assert.h>
-
-// copy from ffmpeg.c
-#include "libavformat/avformat.h"
-#include "libavdevice/avdevice.h"
-#include "libswresample/swresample.h"
-#include "libavutil/opt.h"
-#include "libavutil/channel_layout.h"
-#include "libavutil/parseutils.h"
-#include "libavutil/samplefmt.h"
-#include "libavutil/fifo.h"
-#include "libavutil/hwcontext.h"
-#include "libavutil/intreadwrite.h"
-#include "libavutil/dict.h"
-#include "libavutil/display.h"
-#include "libavutil/mathematics.h"
-#include "libavutil/pixdesc.h"
-#include "libavutil/avstring.h"
-#include "libavutil/imgutils.h"
-#include "libavutil/timestamp.h"
-#include "libavutil/bprint.h"
-#include "libavutil/time.h"
-#include "libavutil/threadmessage.h"
-#include "libavfilter/avfilter.h"
-#include "libavfilter/buffersrc.h"
-#include "libavfilter/buffersink.h"
-
-#include <libavutil/avassert.h>
-#include <libavutil/channel_layout.h>
-#include <libavutil/opt.h>
-#include <libavutil/mathematics.h>
-#include <libavutil/timestamp.h>
-#include <libavformat/avformat.h>
-#include <libswscale/swscale.h>
-#include <libswresample/swresample.h>
-
-#ifdef __cplusplus
-};
-#endif
-
-static int open_codec_context(int* stream_idx, AVCodecContext** dec_ctx, AVFormatContext* fmt_ctx, enum AVMediaType type)
+static void WriteYuvFrameToFile(AVFrame *frame, FILE *fp)
 {
-    int ret, stream_index;
-    AVStream* st;
-    AVCodec* dec = NULL;
-    AVDictionary* opts = NULL;
-
-    ret = av_find_best_stream(fmt_ctx, type, -1, -1, NULL, 0);
-    if (ret < 0)
-    {
-        fprintf(stderr, "Could not find %s stream in input file \n", av_get_media_type_string(type));
-        return ret;
-    }
-    else
-    {
-        stream_index = ret;
-        st = fmt_ctx->streams[stream_index];
-
-        /* find decoder for the stream */
-        dec = avcodec_find_decoder(st->codecpar->codec_id);
-        if (!dec)
-        {
-            fprintf(stderr, "Failed to find %s codec\n", av_get_media_type_string(type));
-            return AVERROR(EINVAL);
-        }
-
-        /* Allocate a codec context for the decoder */
-        *dec_ctx = avcodec_alloc_context3(dec);
-        if (!*dec_ctx)
-        {
-            fprintf(stderr, "Failed to allocate the %s codec context\n", av_get_media_type_string(type));
-            return AVERROR(ENOMEM);
-        }
-
-        /* Copy codec parameters from input stream to output codec context */
-        if ((ret = avcodec_parameters_to_context(*dec_ctx, st->codecpar)) < 0)
-        {
-            fprintf(stderr, "Failed to copy %s codec parameters to decoder context\n", av_get_media_type_string(type));
-            return ret;
-        }
-
-        /* Init the decoders, with or without reference counting */
-        if ((ret = avcodec_open2(*dec_ctx, dec, NULL)) < 0)
-        {
-            fprintf(stderr, "Failed to open %s codec\n", av_get_media_type_string(type));
-            return ret;
-        }
-        (*dec_ctx)->thread_count = 8;
-        *stream_idx = stream_index;
-    }
-
-    return 0;
-}
-Record::Record(const std::string& filename)
-    : filename_(filename)
-    , stream_indexs_(255, 0)
-    , runing_(false) {};
-
-Record::~Record()
-{
-    avformat_close_input(&input_fmt_ctx_);
-    avformat_free_context(input_fmt_ctx_);
-    avcodec_close(decoder_codec_ctx_);
-    av_frame_free(&yuv_frame_);
-    av_free(image_buffer_);
-    sws_freeContext(sws_ctx_);
-
-    avformat_close_input(&output_fmt_ctx_);
-    avformat_free_context(output_fmt_ctx_);
-    avcodec_close(encoder_codec_ctx_);
+    assert(frame);
+    assert(fp);
+    int y_size = frame->width * frame->height;
+    fwrite(frame->data[0], 1, y_size, fp);      // Y
+    fwrite(frame->data[1], 1, y_size / 4, fp);  // U
+    fwrite(frame->data[2], 1, y_size / 4, fp);  // V
 }
 
-void Record::InitEnv()
+static void WritePacketToFile(AVPacket *pkt, FILE *fp)
 {
-    avdevice_register_all();
-
-    InitInput();
-
-    InitOutput();
+    assert(pkt);
+    assert(fp);
+    fwrite(pkt->data, 1, pkt->size, fp);
 }
 
-void Record::Stop()
+static void ConverterYuvFrame(SwsContext *sws_ctx, AVFrame *dst, AVFrame *src)
 {
-    runing_.store(false);
+    av_frame_make_writable(dst);
+    auto h = src->height;
+    auto ptr = reinterpret_cast<const uint8_t *const *>(src->data);
+    auto data_ptr = dst->data;
+    sws_scale(sws_ctx, ptr, src->linesize, 0, h, data_ptr, dst->linesize);
+    av_frame_copy_props(dst, src);
 }
 
-void Record::InitInput()
+static int DecodePacketToFrame(AVCodecContext *ctx, AVFrame *frame, AVPacket *packet)
 {
-    AVDictionary* options = NULL;
-    int ret = av_dict_set(&options, "capture_cursor", "1", 0);
-    if (ret < 0)
+
+    int status = avcodec_send_packet(ctx, packet);
+
+    if (status < 0)
     {
-        printf("\nerror in setting capture_cursor values");
-        exit(1);
+        return status;
     }
 
-    ret = av_dict_set(&options, "capture_mouse_clicks", "1", 0);
-    if (ret < 0)
+    status = avcodec_receive_frame(ctx, frame);
+
+    if (status == AVERROR(EAGAIN) || status == AVERROR_EOF)
     {
-        printf("\nerror in setting capture_cursor values");
-        exit(1);
+        return status;
     }
 
-    ret = av_dict_set(&options, "pixel_format", "yuyv420", 0);
-    if (ret < 0)
+    if (status < 0)
     {
-        printf("\nerror in setting pixel_format values");
-        exit(1);
+        return status;
     }
 
-    ret = av_dict_set(&options, "framerate", "60", 0);
-    if (ret < 0)
-    {
-        printf("\nerror in setting pixel_format values");
-        exit(1);
-    }
-
-    ret = av_dict_set(&options, "video_size", "1920x1080", 0);
-    if (ret < 0)
-    {
-        printf("\nerror in setting pixel_format values");
-        exit(1);
-    }
-
-    auto dict_scoped = make_scoped_exit([& op = options]() { av_dict_free(&op); });
-
-    input_fmt_ = av_find_input_format("x11grab");
-    if (!input_fmt_)
-    {
-        printf("not found x11\n");
-        exit(1);
-    }
-    input_fmt_ctx_ = NULL;
-    ret = avformat_open_input(&input_fmt_ctx_, filename_.data(), input_fmt_, &options);
-    if (ret < 0)
-    {
-        printf("Couldn't open input stream.\n");
-        exit(1);
-    }
-
-    assert(input_fmt_ctx_);
-
-    if (avformat_find_stream_info(input_fmt_ctx_, NULL) < 0)
-    {
-        printf("Couldn't find stream information.\n");
-        exit(1);
-    }
-
-    av_dump_format(input_fmt_ctx_, 0, filename_.data(), 0);
-
-    int video_stream_idx = -1;
-    decoder_codec_ctx_ = NULL;
-    ret = open_codec_context(&video_stream_idx, &decoder_codec_ctx_, input_fmt_ctx_, AVMEDIA_TYPE_VIDEO);
-    if (ret < 0)
-    {
-        printf("open codec context failed\n");
-        exit(1);
-    }
-
-    assert(decoder_codec_ctx_);
-    assert(video_stream_idx != -1);
-    assert(video_stream_idx < 255);
-    stream_indexs_[video_stream_idx] = 1;
-
-    int decodec_width = decoder_codec_ctx_->width;
-    int decodec_height = decoder_codec_ctx_->height;
-    yuv_frame_ = av_frame_alloc();
-    assert(yuv_frame_);
-    int image_size = av_image_get_buffer_size(AV_PIX_FMT_YUV420P, decodec_width, decodec_height, 1);
-    assert(image_size >= 0);
-    image_buffer_ = (uint8_t*)av_malloc(image_size);
-    assert(image_buffer_);
-
-    av_image_fill_arrays(yuv_frame_->data, yuv_frame_->linesize, image_buffer_, AV_PIX_FMT_YUV420P, decodec_width, decodec_height, 1);
-
-    sws_ctx_ = sws_getContext(decodec_width, decodec_height, decoder_codec_ctx_->pix_fmt, decodec_width, decodec_height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
-    assert(sws_ctx_);
+    return status;
 }
 
-void Record::InitOutput()
+static int EncodeFrameToPacket(AVCodecContext *ctx, AVFrame *frame, AVPacket *packet)
 {
-    output_fmt_ctx_ = NULL;
-    out_name_ = std::to_string(::time(NULL));
-    out_name_ += ".mp4";
-    avformat_alloc_output_context2(&output_fmt_ctx_, NULL, NULL, out_name_.data());
-    assert(output_fmt_ctx_);
 
-    output_fmt_ = av_guess_format(NULL, out_name_.data(), NULL);
-    assert(output_fmt_);
-    output_fmt_ctx_->oformat = output_fmt_;
-    output_stream_ = avformat_new_stream(output_fmt_ctx_, NULL);
-    assert(output_stream_);
-
-    output_codec_ = avcodec_find_encoder(AV_CODEC_ID_MPEG4);
-    if (!output_codec_)
+    int status = avcodec_send_frame(ctx, frame);
+    if (status < 0)
     {
-        printf("Could not find encoder for '%s'\n", avcodec_get_name(AV_CODEC_ID_MPEG4));
-        exit(1);
+        return status;
     }
 
-    encoder_codec_ctx_ = avcodec_alloc_context3(output_codec_);
-    assert(encoder_codec_ctx_);
-    encoder_codec_ctx_->codec_id = AV_CODEC_ID_MPEG4;
-    encoder_codec_ctx_->codec_type = AVMEDIA_TYPE_VIDEO;
-    encoder_codec_ctx_->bit_rate = 400000;
-    encoder_codec_ctx_->width = decoder_codec_ctx_->width;
-    encoder_codec_ctx_->height = decoder_codec_ctx_->height;
-    encoder_codec_ctx_->time_base = (AVRational) {1, 25};
-    encoder_codec_ctx_->gop_size = 12;
-    encoder_codec_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
+    status = avcodec_receive_packet(ctx, packet);
 
-    if (output_fmt_->flags & AVFMT_GLOBALHEADER)
+    if (status == AVERROR(EAGAIN) || status == AVERROR_EOF)
     {
-        encoder_codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        return status;
     }
 
-    int ret = avcodec_open2(encoder_codec_ctx_, output_codec_, NULL);
-    if (ret < 0)
+    if (status < 0)
     {
-        printf("avcodec_open2 failed\n");
-        exit(1);
+        return status;
     }
 
-    avcodec_parameters_from_context(output_stream_->codecpar, encoder_codec_ctx_);
+    return status;
+}
 
-    if (!(output_fmt_->flags & AVFMT_NOFILE))
+RecordScreen::RecordScreen(const std::string &url)
+    : url_ {url}
+    , runing {false} {};
+
+RecordScreen::~RecordScreen()
+{
+    assert(runing == false);
+    CleanUp();
+}
+
+void RecordScreen::InitEnv()
+{
+    InitAv();
+    InitializeDecoder();
+    InitializeEncoder();
+    InitializeConverter();
+}
+void RecordScreen::Run()
+{
+    std::string file_name = std::to_string(time(NULL));
+    file_name += ".264";
+    FILE *fp = fopen(file_name.data(), "wb");
+    assert(fp);
+    auto close_file = make_scoped_exit([&fp = fp]() { fclose(fp); });
+    runing = true;
+    auto stop_clean = make_scoped_exit([&run = runing]() { run = false; });
+    while (runing)
     {
-        ret = avio_open(&output_fmt_ctx_->pb, out_name_.data(), AVIO_FLAG_WRITE);
-        if (ret < 0)
+        if (av_read_frame(in_fmt_ctx, decoding_packet) < 0)
         {
-            printf("Could not open output file '%s'", out_name_.data());
-            exit(1);
+            break;  // log ?
         }
-    }
+        auto dec_pkt = make_scoped_exit([&pkt = decoding_packet]() { av_packet_unref(pkt); });
 
-    AVDictionary* opt = NULL;
-    av_dict_set_int(&opt, "video_track_timescale", 25, 0);
-    auto scoped_opt = make_scoped_exit([&opt]() { av_dict_free(&opt); });
-    ret = avformat_write_header(output_fmt_ctx_, &opt);
-    if (ret < 0)
-    {
-        printf("Error occurred when opening output file\n");
-        exit(1);
-    }
-}
-
-#define CONTINUE_OR_BREAK                                 \
-    {                                                     \
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) \
-        {                                                 \
-                                                          \
-            continue;                                     \
-        }                                                 \
-        if (ret < 0)                                      \
-        {                                                 \
-            assert(false);                                \
-            break;                                        \
-        }                                                 \
-    }
-
-void Record::Run()
-{
-    AVFrame* frame = av_frame_alloc();
-    AVFrame* pFrameYUV = yuv_frame_;
-    AVPacket* packet = av_packet_alloc();
-
-    if (!frame || !packet)
-    {
-        printf("frame or packet alloc failed\n");
-        exit(1);
-    }
-    av_init_packet(packet);
-
-    auto scoped_frame = make_scoped_exit([&]() { av_frame_free(&frame); av_packet_free(&packet); });
-
-    std::string file_name = std::to_string(::time(NULL));
-    file_name += ".yuv";
-
-    FILE* fp_yuv = fopen(file_name.data(), "wb+");
-    assert(fp_yuv);
-    auto scoped = make_scoped_exit([& fp = fp_yuv]() { fclose(fp); });
-    runing_.store(true);
-    while (runing_.load())
-    {
-        int ret = av_read_frame(input_fmt_ctx_, packet);
-        if (ret < 0)
-        {
-            break;
-        }
-        if (stream_indexs_[packet->stream_index] != 1)
+        if (decoding_packet->stream_index != stream_index)
         {
             continue;
         }
-
-        auto scoped_packet1 = make_scoped_exit([& pkt = packet]() { av_packet_unref(pkt); });
-
-        ret = DecodeFrame(decoder_codec_ctx_, frame, packet);
-        CONTINUE_OR_BREAK;
-        assert(ret == 0);
-
-        sws_scale(sws_ctx_, (const unsigned char* const*)frame->data, frame->linesize, 0, decoder_codec_ctx_->height, pFrameYUV->data, pFrameYUV->linesize);
-
-        WriteFile(decoder_codec_ctx_, pFrameYUV, fp_yuv);
-
-        pFrameYUV->format = AV_PIX_FMT_YUV420P;
-        pFrameYUV->width = encoder_codec_ctx_->width;
-        pFrameYUV->height = encoder_codec_ctx_->height;
-
-        AVPacket out_packet = {0};
-        av_init_packet(&out_packet);
-        out_packet.data = NULL;
-        out_packet.size = 0;
-
-        ret = EncodePacket(encoder_codec_ctx_, pFrameYUV, &out_packet);
-        CONTINUE_OR_BREAK;
-
-        auto scoped_packet = make_scoped_exit([& pkt = out_packet]() { av_packet_unref(&pkt); });
-
-        if (out_packet.pts != AV_NOPTS_VALUE)
+        if (DecodePacketToFrame(in_codec_ctx, raw_frame_, decoding_packet) < 0)
         {
-            out_packet.pts = av_rescale_q(out_packet.pts, encoder_codec_ctx_->time_base, output_stream_->time_base);
+            continue;
         }
-
-        if (av_write_frame(output_fmt_ctx_, &out_packet) != 0)
+        auto raw_fm = make_scoped_exit([&f = raw_frame_]() { av_frame_unref(f); });
+        ConverterYuvFrame(converter_ctx_, converter_frame, raw_frame_);
+        if (EncodeFrameToPacket(out_codec_ctx, converter_frame, out_pkt) < 0)
         {
-            assert(false);
+            continue;
         }
+        auto pkt = make_scoped_exit([&pkt = out_pkt]() { av_packet_unref(pkt); });
+        fwrite(out_pkt->data, 1, out_pkt->size, fp);
     }
-
-    int ret = av_write_trailer(output_fmt_ctx_);
-    if (ret < 0)
-    {
-        assert(false);
-    }
+    // flush codec ?
+    assert(runing == false);
 }
 
-int Record::DecodeFrame(AVCodecContext* codecContext, AVFrame* frame, AVPacket* packet)
+void RecordScreen::InitAv() { avdevice_register_all(); }
+void RecordScreen::InitializeDecoder()
 {
-    int status = avcodec_send_packet(codecContext, packet);
+    AVInputFormat *input_fmt = av_find_input_format(LINX_X11);
+    in_fmt_ctx = avformat_alloc_context();
 
-    if (status < 0)
-    {
-        return status;
-    }
+    AVDictionary *options = nullptr;
+    av_dict_set(&options, "video_size", "1920*1080", 0);
+    av_dict_set(&options, "pixel_format", av_get_pix_fmt_name(AV_PIX_FMT_YUV420P), 0);
+    av_dict_set(&options, "framerate", "25", 0);
+    auto opt_exit = make_scoped_exit([&op = options]() { av_dict_free(&op); });
 
-    status = avcodec_receive_frame(codecContext, frame);
+    int status = avformat_open_input(&in_fmt_ctx, url_.data(), input_fmt, &options);
+    assert(status == 0);
 
-    if (status == AVERROR(EAGAIN) || status == AVERROR_EOF)
-    {
-        return status;
-    }
+    status = avformat_find_stream_info(in_fmt_ctx, nullptr);
+    assert(status >= 0);
 
-    if (status < 0)
-    {
-        return status;
-    }
+    av_dump_format(in_fmt_ctx, 0, url_.data(), 0);
 
-    return status;
+    AVCodec *in_codec = nullptr;
+    stream_index = av_find_best_stream(in_fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &in_codec, 0);
+    assert(stream_index >= 0);
+    assert(in_codec);
+    AVCodecParameters *cpr = in_fmt_ctx->streams[stream_index]->codecpar;
+    in_codec_ctx = avcodec_alloc_context3(in_codec);
+    assert(in_codec_ctx);
+    status = avcodec_parameters_to_context(in_codec_ctx, cpr);
+    assert(status >= 0);
+    status = avcodec_open2(in_codec_ctx, in_codec, NULL);
+    assert(status == 0);
+    decoding_packet = av_packet_alloc();
+    av_init_packet(decoding_packet);
+    raw_frame_ = av_frame_alloc();
 }
-
-int Record::EncodePacket(AVCodecContext* codecContext, AVFrame* frame, AVPacket* packet)
+void RecordScreen::InitializeEncoder()
 {
-    int status = avcodec_send_frame(codecContext, frame);
+    int statCode = avformat_alloc_output_context2(&out_fmt_ctx, nullptr, "null", nullptr);
+    assert(statCode >= 0);
 
-    if (status < 0)
+    AVCodec *out_codec = avcodec_find_encoder_by_name("libx264");
+    assert(out_codec);
+
+    AVStream *stream = avformat_new_stream(out_fmt_ctx, out_codec);
+    assert(stream);
+    stream->id = out_fmt_ctx->nb_streams - 1;
+
+    out_codec_ctx = avcodec_alloc_context3(out_codec);
+    assert(out_codec_ctx);
+
+    out_codec_ctx->width = WIDTH;
+    out_codec_ctx->height = HEIGHT;
+    out_codec_ctx->bit_rate = 400000;
+    out_codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    out_codec_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
+
+    out_codec_ctx->time_base.den = 25;
+    out_codec_ctx->time_base.num = 1;
+
+    if (out_fmt_ctx->flags & AVFMT_GLOBALHEADER)
     {
-        return status;
+        out_codec_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    status = avcodec_receive_packet(codecContext, packet);
+    avcodec_parameters_from_context(stream->codecpar, out_codec_ctx);
+    AVDictionary *options = nullptr;
+    out_codec_ctx->me_range = 16;
+    out_codec_ctx->max_qdiff = 4;
+    out_codec_ctx->qmin = 10;
+    out_codec_ctx->qmax = 51;
+    out_codec_ctx->qcompress = 0.6;
+    out_codec_ctx->refs = 3;
+    out_codec_ctx->bit_rate = 500000;
 
-    if (status == AVERROR(EAGAIN) || status == AVERROR_EOF)
-    {
-        return status;
-    }
+    statCode = avcodec_open2(out_codec_ctx, out_codec, NULL);
+    av_dict_free(&options);
+    assert(statCode == 0);
+    statCode = avformat_write_header(out_fmt_ctx, nullptr);
+    assert(statCode >= 0);
 
-    if (status < 0)
-    {
-        return status;
-    }
+    av_dump_format(out_fmt_ctx, stream->index, "null", 1);
 
-    return status;
+    out_pkt = av_packet_alloc();
+    av_init_packet(out_pkt);
 }
-
-void Record::WriteFile(AVCodecContext* codecContext, AVFrame* frame, FILE* fp)
+void RecordScreen::InitializeConverter()
 {
-    int y_size = codecContext->width * codecContext->height;
-    fwrite(frame->data[0], 1, y_size, fp);      //Y
-    fwrite(frame->data[1], 1, y_size / 4, fp);  //U
-    fwrite(frame->data[2], 1, y_size / 4, fp);  //V
+    assert(in_codec_ctx);
+    assert(out_codec_ctx);
+    int in_h = in_codec_ctx->height;
+    int in_w = in_codec_ctx->width;
+    int out_h = out_codec_ctx->height;
+    int out_w = out_codec_ctx->width;
+    converter_frame = av_frame_alloc();
+    converter_frame->height = out_h;
+    converter_frame->width = out_w;
+    enum AVPixelFormat pix_fmt = AV_PIX_FMT_YUV420P;
+    enum AVPixelFormat in_pix_fmt = in_codec_ctx->pix_fmt;
+    // libx264 yuv420
+    converter_frame->format = pix_fmt;
+
+    int size = av_image_get_buffer_size(pix_fmt, in_w, in_h, 1);
+    buf = (uint8_t *)av_malloc(size);
+    auto ptr = converter_frame->data;
+    auto lines_ptr = converter_frame->linesize;
+    av_image_fill_arrays(ptr, lines_ptr, buf, pix_fmt, in_w, in_h, 1);
+
+    converter_ctx_ = sws_getContext(
+        in_w, in_h, in_pix_fmt, out_w, out_h, pix_fmt, SWS_BICUBIC, NULL, NULL, NULL);
 }
+
+void RecordScreen::CleanUp()
+{
+    av_free(buf);
+    av_frame_free(&converter_frame);
+    sws_freeContext(converter_ctx_);
+
+    av_frame_free(&raw_frame_);
+    av_packet_free(&decoding_packet);
+    avformat_close_input(&in_fmt_ctx);
+    avformat_free_context(in_fmt_ctx);
+    avcodec_free_context(&in_codec_ctx);
+
+    if (out_fmt_ctx && out_fmt_ctx->oformat && !(out_fmt_ctx->oformat->flags & AVFMT_NOFILE))
+    {
+        avio_closep(&out_fmt_ctx->pb);
+    }
+    av_packet_free(&out_pkt);
+    avformat_free_context(out_fmt_ctx);
+    avcodec_free_context(&out_codec_ctx);
+}
+
+void RecordScreen::Stop() { runing = false; }
