@@ -5,6 +5,8 @@
 #define WIDTH 1920
 #define HEIGHT 1080
 #define LINX_X11 "x11grab"
+#define SFM_REFRESH_EVENT (SDL_USEREVENT + 1)
+#define SFM_BREAK_EVENT (SDL_USEREVENT + 2)
 
 static void WriteYuvFrameToFile(AVFrame *frame, FILE *fp)
 {
@@ -58,30 +60,6 @@ static int DecodePacketToFrame(AVCodecContext *ctx, AVFrame *frame, AVPacket *pa
     return status;
 }
 
-static int EncodeFrameToPacket(AVCodecContext *ctx, AVFrame *frame, AVPacket *packet)
-{
-
-    int status = avcodec_send_frame(ctx, frame);
-    if (status < 0)
-    {
-        return status;
-    }
-
-    status = avcodec_receive_packet(ctx, packet);
-
-    if (status == AVERROR(EAGAIN) || status == AVERROR_EOF)
-    {
-        return status;
-    }
-
-    if (status < 0)
-    {
-        return status;
-    }
-
-    return status;
-}
-
 RecordScreen::RecordScreen(const std::string &url)
     : url_ {url}
     , runing {false} {};
@@ -89,55 +67,127 @@ RecordScreen::RecordScreen(const std::string &url)
 RecordScreen::~RecordScreen()
 {
     assert(runing == false);
-    CleanUp();
+    CleanAV();
+    CleanSdl();
+    fprintf(stderr, "RecordScreen Deconstructor\n");
 }
 
 void RecordScreen::InitEnv()
 {
     InitAv();
     InitializeDecoder();
-    InitializeEncoder();
     InitializeConverter();
+    InitSdlEnv();
 }
+
 void RecordScreen::Run()
 {
-    std::string file_name = std::to_string(time(NULL));
-    file_name += ".264";
-    FILE *fp = fopen(file_name.data(), "wb");
-    assert(fp);
-    auto close_file = make_scoped_exit([&fp = fp]() { fclose(fp); });
+    // sdl
+    RunSdl();
+    //
     runing = true;
-    auto stop_clean = make_scoped_exit([&run = runing]() { run = false; });
+
+    SDL_Event event;
     while (runing)
     {
-        if (av_read_frame(in_fmt_ctx, decoding_packet) < 0)
+        SDL_WaitEvent(&event);
+        if (event.type == SFM_REFRESH_EVENT)
         {
-            break;  // log ?
+            if (RecordScreenAndDisplay() != 0)
+            {
+                break;
+            }
         }
-        auto dec_pkt = make_scoped_exit([&pkt = decoding_packet]() { av_packet_unref(pkt); });
-
-        if (decoding_packet->stream_index != stream_index)
+        else if (event.type == SDL_KEYDOWN)
         {
-            continue;
+            if (event.key.keysym.sym == SDLK_SPACE)
+            {
+                sdl_.sdl_refresh_.store(!sdl_.sdl_refresh_.load());
+            }
         }
-        if (DecodePacketToFrame(in_codec_ctx, raw_frame_, decoding_packet) < 0)
+        else if (event.type == SDL_QUIT)
         {
-            continue;
+            break;
         }
-        auto raw_fm = make_scoped_exit([&f = raw_frame_]() { av_frame_unref(f); });
-        ConverterYuvFrame(converter_ctx_, converter_frame, raw_frame_);
-        if (EncodeFrameToPacket(out_codec_ctx, converter_frame, out_pkt) < 0)
+        else if (event.type == SFM_BREAK_EVENT)
         {
-            continue;
+            break;
         }
-        auto pkt = make_scoped_exit([&pkt = out_pkt]() { av_packet_unref(pkt); });
-        fwrite(out_pkt->data, 1, out_pkt->size, fp);
     }
     // flush codec ?
-    assert(runing == false);
+    sdl_.sdl_stop_.store(true);
+    runing = false;
+}
+
+int RecordScreen::RecordScreenAndDisplay()
+{
+
+#define RECORD_ERROR -1
+#define RECORD_EAGAIN 0
+#define RECORD_SUCCESS 0
+
+    Record r = AvRecordScreen();
+    if (!r.record_)
+    {
+        return RECORD_ERROR;
+    }
+    assert(r.record_);
+    if (!r.screen)
+    {
+        return RECORD_EAGAIN;
+    }
+    assert(r.screen);
+    //
+    SdlDisplayRecord(r);
+    return RECORD_SUCCESS;
+}
+
+void RecordScreen::SdlDisplayRecord(const Record &record)
+{
+    SDL_Rect sdlRect;
+    sdlRect.x = 0;
+    sdlRect.y = 0;
+    sdlRect.w = sdl_.w;
+    sdlRect.h = sdl_.h;
+
+    auto record_frame = record.screen;
+    SDL_UpdateYUVTexture(sdl_.sdlTexture,
+                         &sdlRect,
+                         record_frame->data[0],
+                         record_frame->linesize[0],
+                         record_frame->data[1],
+                         record_frame->linesize[1],
+                         record_frame->data[2],
+                         record_frame->linesize[2]);
+
+    SDL_RenderClear(sdl_.sdlRenderer);
+    SDL_RenderCopy(sdl_.sdlRenderer, sdl_.sdlTexture, NULL, &sdlRect);
+    SDL_RenderPresent(sdl_.sdlRenderer);
+}
+
+RecordScreen::Record RecordScreen::AvRecordScreen()
+{
+    if (av_read_frame(in_fmt_ctx, decoding_packet) < 0)
+    {
+        return {false, NULL};
+    }
+    auto dec_pkt = make_scoped_exit([&pkt = decoding_packet]() { av_packet_unref(pkt); });
+
+    if (decoding_packet->stream_index != stream_index)
+    {
+        return {true, NULL};
+    }
+    if (DecodePacketToFrame(in_codec_ctx, raw_frame_, decoding_packet) < 0)
+    {
+        return {true, NULL};
+    }
+    auto raw_fm = make_scoped_exit([&f = raw_frame_]() { av_frame_unref(f); });
+    ConverterYuvFrame(converter_ctx_, converter_frame, raw_frame_);
+    return {true, converter_frame};
 }
 
 void RecordScreen::InitAv() { avdevice_register_all(); }
+
 void RecordScreen::InitializeDecoder()
 {
     AVInputFormat *input_fmt = av_find_input_format(LINX_X11);
@@ -172,67 +222,15 @@ void RecordScreen::InitializeDecoder()
     av_init_packet(decoding_packet);
     raw_frame_ = av_frame_alloc();
 }
-void RecordScreen::InitializeEncoder()
-{
-    int statCode = avformat_alloc_output_context2(&out_fmt_ctx, nullptr, "null", nullptr);
-    assert(statCode >= 0);
 
-    AVCodec *out_codec = avcodec_find_encoder_by_name("libx264");
-    assert(out_codec);
-
-    AVStream *stream = avformat_new_stream(out_fmt_ctx, out_codec);
-    assert(stream);
-    stream->id = out_fmt_ctx->nb_streams - 1;
-
-    out_codec_ctx = avcodec_alloc_context3(out_codec);
-    assert(out_codec_ctx);
-
-    out_codec_ctx->width = WIDTH;
-    out_codec_ctx->height = HEIGHT;
-    out_codec_ctx->bit_rate = 400000;
-    out_codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    out_codec_ctx->codec_type = AVMEDIA_TYPE_VIDEO;
-
-    out_codec_ctx->time_base.den = 25;
-    out_codec_ctx->time_base.num = 1;
-
-    if (out_fmt_ctx->flags & AVFMT_GLOBALHEADER)
-    {
-        out_codec_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    }
-
-    avcodec_parameters_from_context(stream->codecpar, out_codec_ctx);
-    AVDictionary *options = nullptr;
-    out_codec_ctx->me_range = 16;
-    out_codec_ctx->max_qdiff = 4;
-    out_codec_ctx->qmin = 10;
-    out_codec_ctx->qmax = 51;
-    out_codec_ctx->qcompress = 0.6;
-    out_codec_ctx->refs = 3;
-    out_codec_ctx->bit_rate = 500000;
-
-    statCode = avcodec_open2(out_codec_ctx, out_codec, NULL);
-    av_dict_free(&options);
-    assert(statCode == 0);
-    statCode = avformat_write_header(out_fmt_ctx, nullptr);
-    assert(statCode >= 0);
-
-    av_dump_format(out_fmt_ctx, stream->index, "null", 1);
-
-    out_pkt = av_packet_alloc();
-    av_init_packet(out_pkt);
-}
 void RecordScreen::InitializeConverter()
 {
     assert(in_codec_ctx);
-    assert(out_codec_ctx);
     int in_h = in_codec_ctx->height;
     int in_w = in_codec_ctx->width;
-    int out_h = out_codec_ctx->height;
-    int out_w = out_codec_ctx->width;
     converter_frame = av_frame_alloc();
-    converter_frame->height = out_h;
-    converter_frame->width = out_w;
+    converter_frame->height = in_h;
+    converter_frame->width = in_w;
     enum AVPixelFormat pix_fmt = AV_PIX_FMT_YUV420P;
     enum AVPixelFormat in_pix_fmt = in_codec_ctx->pix_fmt;
     // libx264 yuv420
@@ -245,11 +243,12 @@ void RecordScreen::InitializeConverter()
     av_image_fill_arrays(ptr, lines_ptr, buf, pix_fmt, in_w, in_h, 1);
 
     converter_ctx_ = sws_getContext(
-        in_w, in_h, in_pix_fmt, out_w, out_h, pix_fmt, SWS_BICUBIC, NULL, NULL, NULL);
+        in_w, in_h, in_pix_fmt, in_w, in_h, pix_fmt, SWS_BICUBIC, NULL, NULL, NULL);
 }
 
-void RecordScreen::CleanUp()
+void RecordScreen::CleanAV()
 {
+    fprintf(stderr, "~~~~~ CleanAV begin ~~~~~\n");
     av_free(buf);
     av_frame_free(&converter_frame);
     sws_freeContext(converter_ctx_);
@@ -260,13 +259,72 @@ void RecordScreen::CleanUp()
     avformat_free_context(in_fmt_ctx);
     avcodec_free_context(&in_codec_ctx);
 
-    if (out_fmt_ctx && out_fmt_ctx->oformat && !(out_fmt_ctx->oformat->flags & AVFMT_NOFILE))
-    {
-        avio_closep(&out_fmt_ctx->pb);
-    }
-    av_packet_free(&out_pkt);
-    avformat_free_context(out_fmt_ctx);
-    avcodec_free_context(&out_codec_ctx);
+    fprintf(stderr, "~~~~~ CleanAV end ~~~~~\n");
 }
 
 void RecordScreen::Stop() { runing = false; }
+
+void RecordScreen::InitSdlEnv()
+{
+    int w = in_codec_ctx->width;
+    int h = in_codec_ctx->height;
+    const char *title = "screen player";
+    int x = SDL_WINDOWPOS_UNDEFINED;
+    int y = SDL_WINDOWPOS_UNDEFINED;
+    auto screen = SDL_CreateWindow(title, x, y, w, h, SDL_WINDOW_OPENGL);
+    assert(screen);
+    auto renderer = SDL_CreateRenderer(screen, -1, 0);
+    assert(renderer);
+    uint32_t format = SDL_PIXELFORMAT_IYUV;
+    auto texture = SDL_CreateTexture(renderer, format, SDL_TEXTUREACCESS_STREAMING, w, h);
+    assert(texture);
+    sdl_.screen = screen;
+    sdl_.sdlRenderer = renderer;
+    sdl_.sdlTexture = texture;
+    sdl_.w = w;
+    sdl_.h = h;
+}
+
+void RecordScreen::CleanSdl()
+{
+    fprintf(stderr, "~~~~~ CleanSdl begin ~~~~~\n");
+    SDL_DestroyTexture(sdl_.sdlTexture);
+    SDL_DestroyRenderer(sdl_.sdlRenderer);
+    SDL_DestroyWindow(sdl_.screen);
+
+    fprintf(stderr, "~~~~~ CleanSdl end ~~~~~\n");
+}
+
+void RecordScreen::RunSdl() { SDL_CreateThread(SdlThread, "sdl", this); }
+
+int RecordScreen::SdlThread(void *arg)
+{
+    RecordScreen *that = static_cast<RecordScreen *>(arg);
+    assert(that);
+    that->SdlThread();
+    return 0;
+}
+
+void RecordScreen::SdlThread()
+{
+    sdl_.sdl_stop_.store(false);
+    sdl_.sdl_refresh_.store(true);
+    SDL_Event event;
+    event.type = SFM_REFRESH_EVENT;
+    while (!sdl_.sdl_stop_.load())
+    {
+        if (sdl_.sdl_refresh_.load())
+        {
+            SDL_PushEvent(&event);
+        }
+        SDL_Delay(25);
+    }
+    sdl_.sdl_stop_.store(false);
+    sdl_.sdl_refresh_.store(false);
+
+    {
+        SDL_Event event;
+        event.type = SFM_BREAK_EVENT;
+        SDL_PushEvent(&event);
+    }
+}

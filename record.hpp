@@ -2,12 +2,19 @@
 #define __RECORD_HPP__
 
 #include <string>
+#include <atomic>
 
 struct AVFormatContext;
 struct AVCodecContext;
 struct AVFrame;
 struct AVPacket;
 struct SwsContext;
+
+// sdl
+
+struct SDL_Window;
+struct SDL_Renderer;
+struct SDL_Texture;
 
 class noncopyable
 {
@@ -28,28 +35,54 @@ public:
     void InitEnv();
     void Run();
     void Stop();
+    static int SdlThread(void *arg);
+
+private:
+    struct Record
+    {
+        bool record_;
+        AVFrame *screen;
+    };
+
+    struct SdlImpl
+    {
+        SDL_Window *screen;
+        SDL_Renderer *sdlRenderer;
+        SDL_Texture *sdlTexture;
+        int w;  // window width;
+        int h;  // window height
+        std::atomic<bool> sdl_stop_;
+        std::atomic<bool> sdl_refresh_;
+    };
 
 private:
     void InitAv();
     void InitializeDecoder();
     void InitializeEncoder();
     void InitializeConverter();
-    void CleanUp();
+    void InitSdlEnv();
+    void SdlThread();
+    void RunSdl();
+    int RecordScreenAndDisplay();
+    void CleanAV();
+    void CleanSdl();
+    Record AvRecordScreen();
+    void SdlDisplayRecord(const Record &);
 
 private:
     AVFormatContext *in_fmt_ctx = nullptr;
     AVCodecContext *in_codec_ctx = nullptr;
-    AVFormatContext *out_fmt_ctx = nullptr;
-    AVCodecContext *out_codec_ctx = nullptr;
     AVFrame *raw_frame_ = nullptr;
     AVFrame *converter_frame = nullptr;
-    AVPacket *out_pkt = nullptr;
     AVPacket *decoding_packet = nullptr;
     SwsContext *converter_ctx_ = nullptr;
     int stream_index = -1;
     uint8_t *buf = nullptr;
     std::string url_;
     bool runing = false;
+    // sdl
+    SdlImpl sdl_;
+    //
 };
 
 #endif  // __RECORD_HPP__
