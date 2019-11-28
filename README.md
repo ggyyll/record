@@ -1,2 +1,2 @@
 
-`ffmepg record desktop, sdl play`
+`ffmepg record desktop,add filter, sdl play`
