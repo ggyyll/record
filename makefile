@@ -12,7 +12,7 @@ LIBS= -lavdevice -lavfilter -lavformat -lavcodec -lavresample \
 	-lx264  -lxvidcore  -lkvazaar  -pthread  -ldl -lpthread  -lX11 \
 	-static-libstdc++  -Wl,-Bstatic -lx265  -lnuma -lssl -lcrypto  
 
-FLAG= -std=c++14   -g 
+FLAG= -std=c++17   -g 
 
 CC=clang++ 
 

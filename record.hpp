@@ -8,7 +8,10 @@ struct AVFormatContext;
 struct AVCodecContext;
 struct AVFrame;
 struct AVPacket;
-struct SwsContext;
+
+// filter
+struct AVFilterGraph;
+struct AVFilterContext;
 
 // sdl
 
@@ -54,34 +57,44 @@ private:
         std::atomic<bool> sdl_stop_;
         std::atomic<bool> sdl_refresh_;
     };
+    struct FilterImpl
+    {
+        AVFilterGraph *graph_ = nullptr;
+        AVFilterContext *src_ctx_ = nullptr;
+        AVFilterContext *sink_ctx_ = nullptr;
+        AVFrame *frame_ = nullptr;
+        bool invalid;
+    };
 
 private:
     void InitAv();
-    void InitializeDecoder();
+    void InitDecoder();
     void InitializeEncoder();
-    void InitializeConverter();
+    void InitConverter();
+    void InitFilter();
     void InitSdlEnv();
     void SdlThread();
     void RunSdl();
     int RecordScreenAndDisplay();
     void CleanAV();
     void CleanSdl();
+    void CleanFilter();
+    void FilterFrame(const Record &);
     Record AvRecordScreen();
-    void SdlDisplayRecord(const Record &);
+    void SdlDisplayRecord();
 
 private:
     AVFormatContext *in_fmt_ctx = nullptr;
     AVCodecContext *in_codec_ctx = nullptr;
     AVFrame *raw_frame_ = nullptr;
-    AVFrame *converter_frame = nullptr;
     AVPacket *decoding_packet = nullptr;
-    SwsContext *converter_ctx_ = nullptr;
     int stream_index = -1;
-    uint8_t *buf = nullptr;
     std::string url_;
     bool runing = false;
     // sdl
     SdlImpl sdl_;
+    // filter
+    FilterImpl filter_;
     //
 };
 

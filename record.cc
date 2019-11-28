@@ -25,16 +25,6 @@ static void WritePacketToFile(AVPacket *pkt, FILE *fp)
     fwrite(pkt->data, 1, pkt->size, fp);
 }
 
-static void ConverterYuvFrame(SwsContext *sws_ctx, AVFrame *dst, AVFrame *src)
-{
-    av_frame_make_writable(dst);
-    auto h = src->height;
-    auto ptr = reinterpret_cast<const uint8_t *const *>(src->data);
-    auto data_ptr = dst->data;
-    sws_scale(sws_ctx, ptr, src->linesize, 0, h, data_ptr, dst->linesize);
-    av_frame_copy_props(dst, src);
-}
-
 static int DecodePacketToFrame(AVCodecContext *ctx, AVFrame *frame, AVPacket *packet)
 {
 
@@ -69,15 +59,16 @@ RecordScreen::~RecordScreen()
     assert(runing == false);
     CleanAV();
     CleanSdl();
+    CleanFilter();
     fprintf(stderr, "RecordScreen Deconstructor\n");
 }
 
 void RecordScreen::InitEnv()
 {
     InitAv();
-    InitializeDecoder();
-    InitializeConverter();
+    InitDecoder();
     InitSdlEnv();
+    InitFilter();
 }
 
 void RecordScreen::Run()
@@ -137,20 +128,55 @@ int RecordScreen::RecordScreenAndDisplay()
         return RECORD_EAGAIN;
     }
     assert(r.screen);
-    //
-    SdlDisplayRecord(r);
+
+    auto frame_clean = make_scoped_exit([&f = r.screen]() { av_frame_unref(f); });
+
+    FilterFrame(r);
+
+    if (filter_.invalid)
+    {
+        return RECORD_EAGAIN;
+    }
+
+    auto filter_clean = make_scoped_exit([&filter = filter_.frame_]() { av_frame_unref(filter); });
+
+    SdlDisplayRecord();
     return RECORD_SUCCESS;
 }
 
-void RecordScreen::SdlDisplayRecord(const Record &record)
+void RecordScreen::FilterFrame(const Record &r)
 {
+    int ref = AV_BUFFERSRC_FLAG_KEEP_REF;
+    filter_.invalid = true;
+    int status = av_buffersrc_add_frame_flags(filter_.src_ctx_, r.screen, ref);
+    if (status < 0)
+    {
+        return;
+    }
+
+    status = av_buffersink_get_frame(filter_.sink_ctx_, filter_.frame_);
+    if (status == AVERROR(EAGAIN) || status == AVERROR_EOF)
+    {
+        return;
+    }
+
+    filter_.invalid = false;
+}
+
+void RecordScreen::SdlDisplayRecord()
+{
+
+    if (filter_.invalid || !filter_.frame_)
+    {
+        return;
+    }
     SDL_Rect sdlRect;
     sdlRect.x = 0;
     sdlRect.y = 0;
     sdlRect.w = sdl_.w;
     sdlRect.h = sdl_.h;
 
-    auto record_frame = record.screen;
+    auto record_frame = filter_.frame_;
     SDL_UpdateYUVTexture(sdl_.sdlTexture,
                          &sdlRect,
                          record_frame->data[0],
@@ -181,78 +207,12 @@ RecordScreen::Record RecordScreen::AvRecordScreen()
     {
         return {true, NULL};
     }
-    auto raw_fm = make_scoped_exit([&f = raw_frame_]() { av_frame_unref(f); });
-    ConverterYuvFrame(converter_ctx_, converter_frame, raw_frame_);
-    return {true, converter_frame};
-}
-
-void RecordScreen::InitAv() { avdevice_register_all(); }
-
-void RecordScreen::InitializeDecoder()
-{
-    AVInputFormat *input_fmt = av_find_input_format(LINX_X11);
-    in_fmt_ctx = avformat_alloc_context();
-
-    AVDictionary *options = nullptr;
-    av_dict_set(&options, "video_size", "1920*1080", 0);
-    av_dict_set(&options, "pixel_format", av_get_pix_fmt_name(AV_PIX_FMT_YUV420P), 0);
-    av_dict_set(&options, "framerate", "25", 0);
-    auto opt_exit = make_scoped_exit([&op = options]() { av_dict_free(&op); });
-
-    int status = avformat_open_input(&in_fmt_ctx, url_.data(), input_fmt, &options);
-    assert(status == 0);
-
-    status = avformat_find_stream_info(in_fmt_ctx, nullptr);
-    assert(status >= 0);
-
-    av_dump_format(in_fmt_ctx, 0, url_.data(), 0);
-
-    AVCodec *in_codec = nullptr;
-    stream_index = av_find_best_stream(in_fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &in_codec, 0);
-    assert(stream_index >= 0);
-    assert(in_codec);
-    AVCodecParameters *cpr = in_fmt_ctx->streams[stream_index]->codecpar;
-    in_codec_ctx = avcodec_alloc_context3(in_codec);
-    assert(in_codec_ctx);
-    status = avcodec_parameters_to_context(in_codec_ctx, cpr);
-    assert(status >= 0);
-    status = avcodec_open2(in_codec_ctx, in_codec, NULL);
-    assert(status == 0);
-    decoding_packet = av_packet_alloc();
-    av_init_packet(decoding_packet);
-    raw_frame_ = av_frame_alloc();
-}
-
-void RecordScreen::InitializeConverter()
-{
-    assert(in_codec_ctx);
-    int in_h = in_codec_ctx->height;
-    int in_w = in_codec_ctx->width;
-    converter_frame = av_frame_alloc();
-    converter_frame->height = in_h;
-    converter_frame->width = in_w;
-    enum AVPixelFormat pix_fmt = AV_PIX_FMT_YUV420P;
-    enum AVPixelFormat in_pix_fmt = in_codec_ctx->pix_fmt;
-    // libx264 yuv420
-    converter_frame->format = pix_fmt;
-
-    int size = av_image_get_buffer_size(pix_fmt, in_w, in_h, 1);
-    buf = (uint8_t *)av_malloc(size);
-    auto ptr = converter_frame->data;
-    auto lines_ptr = converter_frame->linesize;
-    av_image_fill_arrays(ptr, lines_ptr, buf, pix_fmt, in_w, in_h, 1);
-
-    converter_ctx_ = sws_getContext(
-        in_w, in_h, in_pix_fmt, in_w, in_h, pix_fmt, SWS_BICUBIC, NULL, NULL, NULL);
+    return {true, raw_frame_};
 }
 
 void RecordScreen::CleanAV()
 {
     fprintf(stderr, "~~~~~ CleanAV begin ~~~~~\n");
-    av_free(buf);
-    av_frame_free(&converter_frame);
-    sws_freeContext(converter_ctx_);
-
     av_frame_free(&raw_frame_);
     av_packet_free(&decoding_packet);
     avformat_close_input(&in_fmt_ctx);
@@ -327,4 +287,132 @@ void RecordScreen::SdlThread()
         event.type = SFM_BREAK_EVENT;
         SDL_PushEvent(&event);
     }
+}
+
+void RecordScreen::InitAv() { avdevice_register_all(); }
+
+void RecordScreen::InitDecoder()
+{
+    AVInputFormat *input_fmt = av_find_input_format(LINX_X11);
+    in_fmt_ctx = avformat_alloc_context();
+
+    AVDictionary *options = nullptr;
+    av_dict_set(&options, "video_size", "1920*1080", 0);
+    av_dict_set(&options, "pixel_format", av_get_pix_fmt_name(AV_PIX_FMT_YUV420P), 0);
+    av_dict_set(&options, "framerate", "25", 0);
+    auto opt_exit = make_scoped_exit([&op = options]() { av_dict_free(&op); });
+
+    int status = avformat_open_input(&in_fmt_ctx, url_.data(), input_fmt, &options);
+    assert(status == 0);
+
+    status = avformat_find_stream_info(in_fmt_ctx, nullptr);
+    assert(status >= 0);
+
+    av_dump_format(in_fmt_ctx, 0, url_.data(), 0);
+
+    AVCodec *in_codec = nullptr;
+    stream_index = av_find_best_stream(in_fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &in_codec, 0);
+    assert(stream_index >= 0);
+    assert(in_codec);
+    AVCodecParameters *cpr = in_fmt_ctx->streams[stream_index]->codecpar;
+    in_codec_ctx = avcodec_alloc_context3(in_codec);
+    assert(in_codec_ctx);
+    status = avcodec_parameters_to_context(in_codec_ctx, cpr);
+    assert(status >= 0);
+    status = avcodec_open2(in_codec_ctx, in_codec, NULL);
+    assert(status == 0);
+    decoding_packet = av_packet_alloc();
+    av_init_packet(decoding_packet);
+    raw_frame_ = av_frame_alloc();
+}
+
+void RecordScreen::InitFilter()
+{
+
+    AVFilterGraph *graph = nullptr;
+    AVFilterContext *src_ctx = nullptr;
+    AVFilterContext *sink_ctx = nullptr;
+
+    AVFrame *frame = av_frame_alloc();
+    graph = avfilter_graph_alloc();
+    AVFilterInOut *outputs = avfilter_inout_alloc();
+    AVFilterInOut *inputs = avfilter_inout_alloc();
+
+    assert(frame);
+    assert(graph);
+    assert(inputs);
+    assert(outputs);
+
+    const AVFilter *src = avfilter_get_by_name("buffer");
+    const AVFilter *sink = avfilter_get_by_name("buffersink");
+
+    // see https://www.ffmpeg.org/ffmpeg-all.html#Commands-37
+    const char *filter_descr = "[in]fps=fps=15/1[fps_out];movie=ubuntu.png[ubuntu];movie=google.png[google];[fps_out][ubuntu]overlay=10:10[u_out];[u_out][google]overlay=main_w-overlay_w-100:main_h-overlay_h-100[out]";
+    int status = avfilter_graph_parse2(graph, filter_descr, &inputs, &outputs);
+    assert(status >= 0);
+
+    auto pix_fmt = in_codec_ctx->pix_fmt;
+    int w = in_codec_ctx->width;
+    int h = in_codec_ctx->height;
+
+    AVStream *s = in_fmt_ctx->streams[stream_index];
+    int tn = s->time_base.num;
+    int td = s->time_base.den;
+    int sn = s->sample_aspect_ratio.num;
+    int sd = s->sample_aspect_ratio.den;
+    int rn = s->r_frame_rate.num;
+    int rd = s->r_frame_rate.den;
+
+    char args[255] = {0};
+    const char *fmt = "width=%d:height=%d:pix_fmt=%d:time_base=%d/%d:sar=%d/%d:frame_rate=%d/%d";
+    snprintf(args, sizeof(args) - 1, fmt, w, h, pix_fmt, tn, td, sn, sd, rn, rd);
+    printf("%s\n", args);
+
+    // create buffer source with the specified params
+    int i = 0;
+    AVFilterInOut *cur = inputs;
+    for (; cur; cur = cur->next, ++i)
+    {
+        AVBufferSrcParameters *params = av_buffersrc_parameters_alloc();
+        memset(params, 0, sizeof(*params));
+        params->format = AV_PIX_FMT_NONE;
+
+        char filter_name[255] = {0};
+        snprintf(filter_name, sizeof(filter_name) - 1, "in_%d_%d", i, AVMEDIA_TYPE_VIDEO);
+
+        int status = avfilter_graph_create_filter(&src_ctx, src, filter_name, args, NULL, graph);
+        assert(status >= 0);
+        status = av_buffersrc_parameters_set(src_ctx, params);
+        assert(status >= 0);
+        av_freep(&params);
+        status = avfilter_link(src_ctx, 0, cur->filter_ctx, cur->pad_idx);
+        assert(status >= 0);
+    }
+
+    for (cur = outputs, i = 0; cur; cur = cur->next, ++i)
+    {
+        char fmt[256] = {0};
+        snprintf(fmt, sizeof(fmt) - 1, "out_%d_%d", i, AVMEDIA_TYPE_VIDEO);
+
+        status = avfilter_graph_create_filter(&sink_ctx, sink, fmt, NULL, NULL, graph);
+        assert(status >= 0);
+
+        status = avfilter_link(cur->filter_ctx, cur->pad_idx, sink_ctx, 0);
+        assert(status >= 0);
+    }
+
+    status = avfilter_graph_config(graph, nullptr);
+    assert(status >= 0);
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+    filter_.frame_ = frame;
+    filter_.graph_ = graph;
+    filter_.sink_ctx_ = sink_ctx;
+    filter_.src_ctx_ = src_ctx;
+}
+
+void RecordScreen::CleanFilter()
+{
+    av_frame_free(&filter_.frame_);
+    avfilter_graph_free(&filter_.graph_);
 }
