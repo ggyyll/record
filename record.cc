@@ -347,7 +347,15 @@ void RecordScreen::InitFilter()
     const AVFilter *sink = avfilter_get_by_name("buffersink");
 
     // see https://www.ffmpeg.org/ffmpeg-all.html#Commands-37
-    const char *filter_descr = "[in]fps=fps=15/1[fps_out];movie=ubuntu.png[ubuntu];movie=google.png[google];[fps_out][ubuntu]overlay=10:10[u_out];[u_out][google]overlay=main_w-overlay_w-100:main_h-overlay_h-100[out]";
+    // https://www.ffmpeg.org/ffmpeg-all.html#drawtext-1
+    const char *filter_descr = "[in]fps=fps=15/1[fps_out];[fps_out]drawtext=fontfile=UbuntuMonoforPowerlineNerdFontCompleteMono.ttf:x=500:y=10:fontsize=100:fontcolor=green:text='Hello World'[out_t];movie=ubuntu.png[ubuntu];[out_t][ubuntu]overlay=10:10";
+
+    // const char *filter_descr
+    //= "[in]fps=fps=15/"
+    //"1[fps_out];movie=ubuntu.png[ubuntu];movie=google.png[google];[fps_out][ubuntu]overlay="
+    //"10:10[u_out];[u_out][google]overlay=main_w-overlay_w-100:main_h-overlay_h-100[out_t];["
+    //"out_t]drawtext=fontfile=UbuntuMonoforPowerlineNerdFontCompleteMono.ttf:x=10:y=10:fontsize=30:text='Test Text'[text]";
+
     int status = avfilter_graph_parse2(graph, filter_descr, &inputs, &outputs);
     assert(status >= 0);
 
