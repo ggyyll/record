@@ -60,8 +60,9 @@ static int DecodePacketToFrame(AVCodecContext *ctx, AVFrame *frame, AVPacket *pa
     return status;
 }
 
-RecordScreen::RecordScreen(const std::string &url)
+RecordScreen::RecordScreen(const std::string &url,const std::string &filename)
     : url_ {url}
+    , filename_{filename}
     , runing {false} {};
 
 RecordScreen::~RecordScreen()
@@ -160,6 +161,9 @@ void RecordScreen::SdlDisplayRecord(const Record &record)
                          record_frame->data[2],
                          record_frame->linesize[2]);
 
+    FILE* fp = fopen(filename_.data(),"ab");
+    auto fp_close = make_scoped_exit([&fp=fp](){fclose(fp);});
+    WriteYuvFrameToFile(record_frame,fp);
     SDL_RenderClear(sdl_.sdlRenderer);
     SDL_RenderCopy(sdl_.sdlRenderer, sdl_.sdlTexture, NULL, &sdlRect);
     SDL_RenderPresent(sdl_.sdlRenderer);

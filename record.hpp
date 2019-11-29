@@ -30,7 +30,7 @@ private:
 class RecordScreen : noncopyable
 {
 public:
-    explicit RecordScreen(const std::string &url);
+    explicit RecordScreen(const std::string &url, const std::string &filename);
     ~RecordScreen();
     void InitEnv();
     void Run();
@@ -79,6 +79,7 @@ private:
     int stream_index = -1;
     uint8_t *buf = nullptr;
     std::string url_;
+    std::string filename_;
     bool runing = false;
     // sdl
     SdlImpl sdl_;

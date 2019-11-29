@@ -15,8 +15,9 @@ int main()
     std::signal(SIGINT, signal_handler);
 
     std::string url(":0.0");
+    std::string yuv_filename = "record.yuv";
 
-    RecordScreen record(url);
+    RecordScreen record(url,yuv_filename);
     record.InitEnv();
 
     shutdown_handler = [& record = record]([[maybe_unused]] int signal) { record.Stop(); };
