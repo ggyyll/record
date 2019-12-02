@@ -203,7 +203,8 @@ void RecordScreen::InitializeDecoder()
     av_dict_set(&options, "framerate", "25", 0);
     auto opt_exit = make_scoped_exit([&op = options]() { av_dict_free(&op); });
 
-    int status = avformat_open_input(&in_fmt_ctx, url_.data(), input_fmt, &options);
+    url_ = "/home/gyl/Downloads/jellyfish-10-mbps-hd-h264.mkv";
+    int status = avformat_open_input(&in_fmt_ctx, url_.data(), NULL, &options);
     assert(status == 0);
 
     status = avformat_find_stream_info(in_fmt_ctx, nullptr);
