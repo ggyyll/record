@@ -3,21 +3,19 @@
 
 #include <string>
 #include <atomic>
+#include <deque>
+#include "mutex.hpp"
 
 struct AVFormatContext;
 struct AVCodecContext;
+struct SwsContext;
 struct AVFrame;
 struct AVPacket;
 
-// filter
 struct AVFilterGraph;
 struct AVFilterContext;
-
-// sdl
-
-struct SDL_Window;
-struct SDL_Renderer;
-struct SDL_Texture;
+using AVFramePtr = AVFrame *;
+using AVPacketPtr = AVPacket *;
 
 class noncopyable
 {
@@ -38,64 +36,46 @@ public:
     void InitEnv();
     void Run();
     void Stop();
-    static int SdlThread(void *arg);
 
 private:
-    struct Record
-    {
-        bool record_;
-        AVFrame *screen;
-    };
-
-    struct SdlImpl
-    {
-        SDL_Window *screen;
-        SDL_Renderer *sdlRenderer;
-        SDL_Texture *sdlTexture;
-        int w;  // window width;
-        int h;  // window height
-        std::atomic<bool> sdl_stop_;
-        std::atomic<bool> sdl_refresh_;
-    };
+private:
+    void InitAv();
+    void InitializeDecoder();
+    void CleanAV();
+    void InitFilter();
+    void CleanFilter();
+    void DemuxThread();
+    void DecodeVideo();
+    void FilterThread();
+    void EncodeThread();
+    //  demuxing
     struct FilterImpl
     {
         AVFilterGraph *graph_ = nullptr;
         AVFilterContext *src_ctx_ = nullptr;
         AVFilterContext *sink_ctx_ = nullptr;
-        AVFrame *frame_ = nullptr;
-        bool invalid;
     };
-
-private:
-    void InitAv();
-    void InitDecoder();
-    void InitializeEncoder();
-    void InitConverter();
-    void InitFilter();
-    void InitSdlEnv();
-    void SdlThread();
-    void RunSdl();
-    int RecordScreenAndDisplay();
-    void CleanAV();
-    void CleanSdl();
-    void CleanFilter();
-    void FilterFrame(const Record &);
-    Record AvRecordScreen();
-    void SdlDisplayRecord();
 
 private:
     AVFormatContext *in_fmt_ctx = nullptr;
     AVCodecContext *in_codec_ctx = nullptr;
-    AVFrame *raw_frame_ = nullptr;
-    AVPacket *decoding_packet = nullptr;
+    SwsContext *converter_ctx_ = nullptr;
     int stream_index = -1;
     std::string url_;
-    bool runing = false;
-    // sdl
-    SdlImpl sdl_;
-    // filter
+    std::atomic<bool> runing_;
     FilterImpl filter_;
-    //
+    // TODO thread safe
+    Mutex packet_mutex_;
+    CondVar packet_cond_ GUARDED_BY(packet_mutex_);
+    std::deque<AVPacketPtr> packet_deque_ GUARDED_BY(packet_mutex_);
+
+    Mutex frame_mutex_;
+    CondVar frame_cond_ GUARDED_BY(frame_mutex_);
+    std::deque<AVFramePtr> frame_deque_ GUARDED_BY(frame_mutex_);
+
+    Mutex filter_mutex_;
+    CondVar filter_cond_ GUARDED_BY(filter_mutex_);
+    std::deque<AVFramePtr> filter_deque_ GUARDED_BY(filter_mutex_);
 };
 
 #endif  // __RECORD_HPP__

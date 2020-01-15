@@ -1,6 +1,7 @@
 #include "record.hpp"
-#include "head.hpp"
+#include "av_head.hpp"
 #include "scoped_exit.hpp"
+#include <thread>
 
 #define WIDTH 1920
 #define HEIGHT 1080
@@ -12,53 +13,33 @@ static void WriteYuvFrameToFile(AVFrame *frame, FILE *fp)
 {
     assert(frame);
     assert(fp);
+    printf("w %d h %d\n", frame->width, frame->height);
     int y_size = frame->width * frame->height;
     fwrite(frame->data[0], 1, y_size, fp);      // Y
     fwrite(frame->data[1], 1, y_size / 4, fp);  // U
     fwrite(frame->data[2], 1, y_size / 4, fp);  // V
 }
 
-static void WritePacketToFile(AVPacket *pkt, FILE *fp)
+static void ConverterYuvFrame(SwsContext *sws_ctx, AVFrame *dst, AVFrame *src)
 {
-    assert(pkt);
-    assert(fp);
-    fwrite(pkt->data, 1, pkt->size, fp);
-}
-
-static int DecodePacketToFrame(AVCodecContext *ctx, AVFrame *frame, AVPacket *packet)
-{
-
-    int status = avcodec_send_packet(ctx, packet);
-
-    if (status < 0)
-    {
-        return status;
-    }
-
-    status = avcodec_receive_frame(ctx, frame);
-
-    if (status == AVERROR(EAGAIN) || status == AVERROR_EOF)
-    {
-        return status;
-    }
-
-    if (status < 0)
-    {
-        return status;
-    }
-
-    return status;
+    av_frame_make_writable(dst);
+    auto h = src->height;
+    auto ptr = reinterpret_cast<const uint8_t *const *>(src->data);
+    auto data_ptr = dst->data;
+    sws_scale(sws_ctx, ptr, src->linesize, 0, h, data_ptr, dst->linesize);
+    av_frame_copy_props(dst, src);
 }
 
 RecordScreen::RecordScreen(const std::string &url)
     : url_ {url}
-    , runing {false} {};
+    , packet_cond_(&packet_mutex_)
+    , frame_cond_(&frame_mutex_)
+    , filter_cond_(&filter_mutex_) {};
 
 RecordScreen::~RecordScreen()
 {
-    assert(runing == false);
+    assert(runing_.load() == false);
     CleanAV();
-    CleanSdl();
     CleanFilter();
     fprintf(stderr, "RecordScreen Deconstructor\n");
 }
@@ -66,232 +47,168 @@ RecordScreen::~RecordScreen()
 void RecordScreen::InitEnv()
 {
     InitAv();
-    InitDecoder();
-    InitSdlEnv();
+    InitializeDecoder();
     InitFilter();
 }
 
-void RecordScreen::Run()
+void RecordScreen::DecodeVideo()
 {
-    // sdl
-    RunSdl();
-    //
-    runing = true;
-
-    SDL_Event event;
-    while (runing)
+    while (true)
     {
-        SDL_WaitEvent(&event);
-        if (event.type == SFM_REFRESH_EVENT)
+        AVPacketPtr pkt = nullptr;
         {
-            if (RecordScreenAndDisplay() != 0)
+            MutexLock lock(&packet_mutex_);
+            packet_cond_.Wait();
+            if (runing_.load() == false)
             {
                 break;
             }
+            pkt = packet_deque_.front();
+            packet_deque_.pop_front();
         }
-        else if (event.type == SDL_KEYDOWN)
+        assert(pkt);
+        auto pkt_exit = make_scoped_exit([&]() { av_packet_free(&pkt); });
+        int status = avcodec_send_packet(in_codec_ctx, pkt);
+        if (status < 0)
         {
-            if (event.key.keysym.sym == SDLK_SPACE)
+            continue;
+        }
+        AVFramePtr frame = av_frame_alloc();
+        status = avcodec_receive_frame(in_codec_ctx, frame);
+        if (status < 0)
+        {
+            av_frame_free(&frame);
+            continue;
+        }
+        {
+            MutexLock lock(&frame_mutex_);
+            frame_deque_.push_back(frame);
+            frame_cond_.Signal();
+        }
+    }
+    MutexLock lock(&frame_mutex_);
+    frame_cond_.SignalAll();
+}
+
+void RecordScreen::FilterThread()
+{
+    while (true)
+    {
+        AVFramePtr frame = nullptr;
+        {
+            MutexLock lock(&frame_mutex_);
+            frame_cond_.Wait();
+            if (runing_.load() == false)
             {
-                sdl_.sdl_refresh_.store(!sdl_.sdl_refresh_.load());
+                break;
+            }
+            frame = frame_deque_.front();
+            frame_deque_.pop_front();
+        }
+
+        assert(frame);
+        auto frame_exit = make_scoped_exit([&]() { av_frame_free(&frame); });
+
+        int ref = AV_BUFFERSRC_FLAG_KEEP_REF;
+        int status = av_buffersrc_add_frame_flags(filter_.src_ctx_, frame, ref);
+        if (status < 0)
+        {
+            break;
+        }
+        while (true)
+        {
+            AVFramePtr filter_frame = av_frame_alloc();
+            int status = av_buffersink_get_frame(filter_.sink_ctx_, filter_frame);
+            if (status < 0)
+            {
+                av_frame_free(&filter_frame);
+                break;
+            }
+            {
+                MutexLock lock(&filter_mutex_);
+                filter_deque_.push_back(filter_frame);
+                filter_cond_.Signal();
             }
         }
-        else if (event.type == SDL_QUIT)
+    }
+    MutexLock lock(&filter_mutex_);
+    filter_cond_.SignalAll();
+}
+
+void RecordScreen::EncodeThread()
+{
+    FILE *fp = fopen("record.yuv", "wb");
+    auto file_close = make_scoped_exit([&]() { fclose(fp); });
+
+    while (true)
+    {
+        AVFramePtr filter_frame = nullptr;
+        {
+            MutexLock lock(&filter_mutex_);
+            filter_cond_.Wait();
+            if (runing_.load() == false)
+            {
+                break;
+            }
+            filter_frame = filter_deque_.front();
+            filter_deque_.pop_front();
+        }
+        assert(filter_frame);
+        auto frame_exit = make_scoped_exit([&]() { av_frame_free(&filter_frame); });
+        WriteYuvFrameToFile(filter_frame, fp);
+    }
+}
+
+void RecordScreen::DemuxThread()
+{
+    while (runing_.load())
+    {
+        AVPacket *pkt = av_packet_alloc();
+        auto dec_pkt = make_scoped_exit([&]() { av_packet_free(&pkt); });
+        if (av_read_frame(in_fmt_ctx, pkt) < 0)
         {
             break;
         }
-        else if (event.type == SFM_BREAK_EVENT)
+        if (pkt->stream_index != stream_index)
         {
-            break;
+            continue;
+        }
+        auto clone = av_packet_clone(pkt);
+        {
+            MutexLock lock(&packet_mutex_);
+            packet_deque_.push_back(clone);
+            packet_cond_.Signal();
         }
     }
-    // flush codec ?
-    sdl_.sdl_stop_.store(true);
-    runing = false;
+    runing_.store(false);
+    MutexLock lock(&packet_mutex_);
+    packet_cond_.SignalAll();
 }
-
-int RecordScreen::RecordScreenAndDisplay()
+static void thread_join(std::thread *t)
 {
-
-#define RECORD_ERROR -1
-#define RECORD_EAGAIN 0
-#define RECORD_SUCCESS 0
-
-    Record r = AvRecordScreen();
-    if (!r.record_)
+    if (t->joinable())
     {
-        return RECORD_ERROR;
+        t->join();
     }
-    assert(r.record_);
-    if (!r.screen)
-    {
-        return RECORD_EAGAIN;
-    }
-    assert(r.screen);
-
-    auto frame_clean = make_scoped_exit([&f = r.screen]() { av_frame_unref(f); });
-
-    FilterFrame(r);
-
-    if (filter_.invalid)
-    {
-        return RECORD_EAGAIN;
-    }
-
-    auto filter_clean = make_scoped_exit([&filter = filter_.frame_]() { av_frame_unref(filter); });
-
-    SdlDisplayRecord();
-    return RECORD_SUCCESS;
 }
-
-void RecordScreen::FilterFrame(const Record &r)
+void RecordScreen::Run()
 {
-    int ref = AV_BUFFERSRC_FLAG_KEEP_REF;
-    filter_.invalid = true;
-    int status = av_buffersrc_add_frame_flags(filter_.src_ctx_, r.screen, ref);
-    if (status < 0)
-    {
-        return;
-    }
-
-    status = av_buffersink_get_frame(filter_.sink_ctx_, filter_.frame_);
-    if (status == AVERROR(EAGAIN) || status == AVERROR_EOF)
-    {
-        return;
-    }
-
-    filter_.invalid = false;
-}
-
-void RecordScreen::SdlDisplayRecord()
-{
-
-    if (filter_.invalid || !filter_.frame_)
-    {
-        return;
-    }
-    SDL_Rect sdlRect;
-    sdlRect.x = 0;
-    sdlRect.y = 0;
-    sdlRect.w = sdl_.w;
-    sdlRect.h = sdl_.h;
-
-    auto record_frame = filter_.frame_;
-    SDL_UpdateYUVTexture(sdl_.sdlTexture,
-                         &sdlRect,
-                         record_frame->data[0],
-                         record_frame->linesize[0],
-                         record_frame->data[1],
-                         record_frame->linesize[1],
-                         record_frame->data[2],
-                         record_frame->linesize[2]);
-
-    SDL_RenderClear(sdl_.sdlRenderer);
-    SDL_RenderCopy(sdl_.sdlRenderer, sdl_.sdlTexture, NULL, &sdlRect);
-    SDL_RenderPresent(sdl_.sdlRenderer);
-}
-
-RecordScreen::Record RecordScreen::AvRecordScreen()
-{
-    if (av_read_frame(in_fmt_ctx, decoding_packet) < 0)
-    {
-        return {false, NULL};
-    }
-    auto dec_pkt = make_scoped_exit([&pkt = decoding_packet]() { av_packet_unref(pkt); });
-
-    if (decoding_packet->stream_index != stream_index)
-    {
-        return {true, NULL};
-    }
-    if (DecodePacketToFrame(in_codec_ctx, raw_frame_, decoding_packet) < 0)
-    {
-        return {true, NULL};
-    }
-    return {true, raw_frame_};
-}
-
-void RecordScreen::CleanAV()
-{
-    fprintf(stderr, "~~~~~ CleanAV begin ~~~~~\n");
-    av_frame_free(&raw_frame_);
-    av_packet_free(&decoding_packet);
-    avformat_close_input(&in_fmt_ctx);
-    avformat_free_context(in_fmt_ctx);
-    avcodec_free_context(&in_codec_ctx);
-
-    fprintf(stderr, "~~~~~ CleanAV end ~~~~~\n");
-}
-
-void RecordScreen::Stop() { runing = false; }
-
-void RecordScreen::InitSdlEnv()
-{
-    int w = in_codec_ctx->width;
-    int h = in_codec_ctx->height;
-    const char *title = "screen player";
-    int x = SDL_WINDOWPOS_UNDEFINED;
-    int y = SDL_WINDOWPOS_UNDEFINED;
-    auto screen = SDL_CreateWindow(title, x, y, w, h, SDL_WINDOW_OPENGL);
-    assert(screen);
-    auto renderer = SDL_CreateRenderer(screen, -1, 0);
-    assert(renderer);
-    uint32_t format = SDL_PIXELFORMAT_IYUV;
-    auto texture = SDL_CreateTexture(renderer, format, SDL_TEXTUREACCESS_STREAMING, w, h);
-    assert(texture);
-    sdl_.screen = screen;
-    sdl_.sdlRenderer = renderer;
-    sdl_.sdlTexture = texture;
-    sdl_.w = w;
-    sdl_.h = h;
-}
-
-void RecordScreen::CleanSdl()
-{
-    fprintf(stderr, "~~~~~ CleanSdl begin ~~~~~\n");
-    SDL_DestroyTexture(sdl_.sdlTexture);
-    SDL_DestroyRenderer(sdl_.sdlRenderer);
-    SDL_DestroyWindow(sdl_.screen);
-
-    fprintf(stderr, "~~~~~ CleanSdl end ~~~~~\n");
-}
-
-void RecordScreen::RunSdl() { SDL_CreateThread(SdlThread, "sdl", this); }
-
-int RecordScreen::SdlThread(void *arg)
-{
-    RecordScreen *that = static_cast<RecordScreen *>(arg);
-    assert(that);
-    that->SdlThread();
-    return 0;
-}
-
-void RecordScreen::SdlThread()
-{
-    sdl_.sdl_stop_.store(false);
-    sdl_.sdl_refresh_.store(true);
-    SDL_Event event;
-    event.type = SFM_REFRESH_EVENT;
-    while (!sdl_.sdl_stop_.load())
-    {
-        if (sdl_.sdl_refresh_.load())
-        {
-            SDL_PushEvent(&event);
-        }
-        SDL_Delay(25);
-    }
-    sdl_.sdl_stop_.store(false);
-    sdl_.sdl_refresh_.store(false);
-
-    {
-        SDL_Event event;
-        event.type = SFM_BREAK_EVENT;
-        SDL_PushEvent(&event);
-    }
+    runing_.store(true);
+    std::thread demuxer([&]() { DemuxThread(); });
+    std::thread decoder([&]() { DecodeVideo(); });
+    std::thread filter([&]() { FilterThread(); });
+    std::thread encoder([&]() { EncodeThread(); });
+    // do something ?
+    thread_join(&demuxer);
+    thread_join(&decoder);
+    thread_join(&filter);
+    thread_join(&encoder);
+    assert(runing_.load() == false);
 }
 
 void RecordScreen::InitAv() { avdevice_register_all(); }
 
-void RecordScreen::InitDecoder()
+void RecordScreen::InitializeDecoder()
 {
     AVInputFormat *input_fmt = av_find_input_format(LINX_X11);
     in_fmt_ctx = avformat_alloc_context();
@@ -321,9 +238,15 @@ void RecordScreen::InitDecoder()
     assert(status >= 0);
     status = avcodec_open2(in_codec_ctx, in_codec, NULL);
     assert(status == 0);
-    decoding_packet = av_packet_alloc();
-    av_init_packet(decoding_packet);
-    raw_frame_ = av_frame_alloc();
+}
+
+void RecordScreen::CleanAV()
+{
+    fprintf(stderr, "~~~~~ CleanAV begin ~~~~~\n");
+    avformat_close_input(&in_fmt_ctx);
+    avformat_free_context(in_fmt_ctx);
+    avcodec_free_context(&in_codec_ctx);
+    fprintf(stderr, "~~~~~ CleanAV end ~~~~~\n");
 }
 
 void RecordScreen::InitFilter()
@@ -338,23 +261,19 @@ void RecordScreen::InitFilter()
     AVFilterInOut *outputs = avfilter_inout_alloc();
     AVFilterInOut *inputs = avfilter_inout_alloc();
 
-    assert(frame);
-    assert(graph);
-    assert(inputs);
-    assert(outputs);
+    assert(frame && graph && inputs && outputs);
 
     const AVFilter *src = avfilter_get_by_name("buffer");
     const AVFilter *sink = avfilter_get_by_name("buffersink");
 
     // see https://www.ffmpeg.org/ffmpeg-all.html#Commands-37
     // https://www.ffmpeg.org/ffmpeg-all.html#drawtext-1
-    const char *filter_descr = "[in]fps=fps=15/1[fps_out];[fps_out]drawtext=fontfile=UbuntuMonoforPowerlineNerdFontCompleteMono.ttf:x=500:y=10:fontsize=100:fontcolor=green:text='Hello World'[out_t];movie=ubuntu.png[ubuntu];[out_t][ubuntu]overlay=10:10";
-
-    // const char *filter_descr
-    //= "[in]fps=fps=15/"
-    //"1[fps_out];movie=ubuntu.png[ubuntu];movie=google.png[google];[fps_out][ubuntu]overlay="
-    //"10:10[u_out];[u_out][google]overlay=main_w-overlay_w-100:main_h-overlay_h-100[out_t];["
-    //"out_t]drawtext=fontfile=UbuntuMonoforPowerlineNerdFontCompleteMono.ttf:x=10:y=10:fontsize=30:text='Test Text'[text]";
+    const char *filter_descr
+        = "[in]fps=fps=15/"
+          "1[fps_out];[fps_out]drawtext=fontfile=UbuntuMonoforPowerlineNerdFontCompleteMono.ttf:x="
+          "500:y=10:fontsize=100:fontcolor=green:text='Hello "
+          "World'[out_t];movie=ubuntu.png[ubuntu];[out_t][ubuntu]overlay=10:10[record_in];[record_"
+          "in]drawbox=100:200:200:60:red@0.5:t=1[scale_in];[scale_in]scale=in_w/2:in_h/2";
 
     int status = avfilter_graph_parse2(graph, filter_descr, &inputs, &outputs);
     assert(status >= 0);
@@ -413,14 +332,11 @@ void RecordScreen::InitFilter()
     assert(status >= 0);
     avfilter_inout_free(&inputs);
     avfilter_inout_free(&outputs);
-    filter_.frame_ = frame;
     filter_.graph_ = graph;
     filter_.sink_ctx_ = sink_ctx;
     filter_.src_ctx_ = src_ctx;
 }
 
-void RecordScreen::CleanFilter()
-{
-    av_frame_free(&filter_.frame_);
-    avfilter_graph_free(&filter_.graph_);
-}
+void RecordScreen::CleanFilter() { avfilter_graph_free(&filter_.graph_); }
+
+void RecordScreen::Stop() { runing_.store(false); }
